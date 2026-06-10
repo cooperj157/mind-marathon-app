@@ -1,17 +1,340 @@
-import React from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import React, { useState, useCallback } from 'react';
+import {
+  View, Text, TouchableOpacity, FlatList,
+  StyleSheet, ActivityIndicator, Alert,
+} from 'react-native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { useFocusEffect } from '@react-navigation/native';
 
-export default function LobbyScreen() {
+import { supabase } from '../lib/supabase';
+import { useAuth } from '../hooks/useAuth';
+import { useGames, GameSummary } from '../hooks/useGames';
+import { generateBoardLayout } from '../lib/boardLayout';
+import { RootStackParamList } from '../../App';
+
+type Props = {
+  navigation: NativeStackNavigationProp<RootStackParamList, 'Lobby'>;
+};
+
+const TOTAL_CHECKPOINTS = 6;
+
+function getInitials(name: string): string {
+  return name
+    .split(' ')
+    .map(w => w[0] ?? '')
+    .join('')
+    .toUpperCase()
+    .slice(0, 2);
+}
+
+export default function LobbyScreen({ navigation }: Props) {
+  const { user } = useAuth();
+  const { games, loading, refetch } = useGames(user?.id);
+  const [starting, setStarting] = useState(false);
+
+  // Refresh whenever the screen comes back into focus
+  useFocusEffect(useCallback(() => { refetch(); }, [refetch]));
+
+  async function handleStartGame() {
+    if (!user) return;
+    setStarting(true);
+    try {
+      // Look for a game in 'waiting' status that the current user hasn't joined
+      const { data: waitingGames } = await supabase
+        .from('games')
+        .select('id, game_players(player_id)')
+        .eq('status', 'waiting')
+        .limit(10);
+
+      const joinable = waitingGames?.find(g =>
+        !(g.game_players as { player_id: string }[]).some(p => p.player_id === user.id)
+      );
+
+      if (joinable) {
+        // Join the existing game as player 2
+        await supabase.from('game_players').insert({
+          game_id:         joinable.id,
+          player_id:       user.id,
+          turn_order:      2,
+          is_current_turn: false,
+        });
+        await supabase
+          .from('games')
+          .update({ status: 'active' })
+          .eq('id', joinable.id);
+        navigation.navigate('Game', { gameId: joinable.id });
+      } else {
+        // No waiting game found — create a new one
+        const { data: newGame, error } = await supabase
+          .from('games')
+          .insert({ status: 'waiting', board_layout: generateBoardLayout() })
+          .select()
+          .single();
+
+        if (error || !newGame) throw error ?? new Error('Failed to create game');
+
+        await supabase.from('game_players').insert({
+          game_id:         newGame.id,
+          player_id:       user.id,
+          turn_order:      1,
+          is_current_turn: true,
+        });
+        navigation.navigate('Game', { gameId: newGame.id });
+      }
+    } catch (err: any) {
+      Alert.alert('Error', err?.message ?? 'Could not start game. Please try again.');
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  function renderGame({ item }: { item: GameSummary }) {
+    const initials = getInitials(item.opponentName);
+    return (
+      <View style={styles.card}>
+
+        <View style={styles.avatar}>
+          <Text style={styles.avatarText}>{initials}</Text>
+        </View>
+
+        <View style={styles.cardInfo}>
+          <Text style={styles.opponentName} numberOfLines={1}>{item.opponentName}</Text>
+
+          <View style={styles.turnRow}>
+            <View style={[styles.dot, item.isMyTurn ? styles.dotGreen : styles.dotGold]} />
+            <Text style={[styles.turnLabel, item.isMyTurn ? styles.turnGreen : styles.turnGold]}>
+              {item.isMyTurn ? 'Your turn' : 'Their turn'}
+            </Text>
+          </View>
+
+          <View style={styles.pips}>
+            {Array.from({ length: TOTAL_CHECKPOINTS }).map((_, i) => (
+              <View key={i} style={[styles.pip, i < item.myCheckpoints.length && styles.pipFilled]} />
+            ))}
+          </View>
+        </View>
+
+        <TouchableOpacity
+          style={[styles.resumeBtn, !item.isMyTurn && styles.resumeBtnDisabled]}
+          onPress={() => navigation.navigate('Game', { gameId: item.gameId })}
+        >
+          <Text style={[styles.resumeText, !item.isMyTurn && styles.resumeTextDisabled]}>
+            Resume
+          </Text>
+        </TouchableOpacity>
+
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
-      <Text style={styles.title}>Lobby</Text>
-      <Text style={styles.subtitle}>Your active games will appear here</Text>
+
+      {/* Start Game */}
+      <TouchableOpacity style={styles.startBtn} onPress={handleStartGame} disabled={starting}>
+        {starting ? (
+          <ActivityIndicator color="#F5DEB3" />
+        ) : (
+          <>
+            <View style={styles.startIcon}>
+              <Text style={styles.startIconText}>▶</Text>
+            </View>
+            <Text style={styles.startLabel}>Start Game</Text>
+          </>
+        )}
+      </TouchableOpacity>
+
+      {/* Section header */}
+      <View style={styles.sectionRow}>
+        <Text style={styles.sectionHeading}>ACTIVE GAMES</Text>
+        <View style={styles.sectionLine} />
+      </View>
+
+      {/* Game list / states */}
+      {loading ? (
+        <ActivityIndicator style={{ marginTop: 32 }} color="#2C1810" />
+      ) : games.length === 0 ? (
+        <View style={styles.empty}>
+          <Text style={styles.emptyIcon}>🎲</Text>
+          <Text style={styles.emptyTitle}>No games yet</Text>
+          <Text style={styles.emptySub}>Tap Start Game to find an opponent</Text>
+        </View>
+      ) : (
+        <FlatList
+          data={games}
+          keyExtractor={g => g.gameId}
+          renderItem={renderGame}
+          contentContainerStyle={{ gap: 10, paddingBottom: 32 }}
+          showsVerticalScrollIndicator={false}
+        />
+      )}
+
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F4E4BC' },
-  title:     { fontSize: 28, fontWeight: 'bold', color: '#2C1810', marginBottom: 8 },
-  subtitle:  { fontSize: 16, color: '#5C3317' },
+  container: {
+    flex: 1,
+    backgroundColor: '#F4E4BC',
+    padding: 20,
+  },
+
+  // ── Start Game button ──
+  startBtn: {
+    backgroundColor: '#2C1810',
+    borderRadius: 14,
+    paddingVertical: 18,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    marginBottom: 28,
+    shadowColor: '#1a0e08',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 1,
+    shadowRadius: 0,
+    elevation: 4,
+  },
+  startIcon: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#C8930A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  startIconText: {
+    color: '#2C1810',
+    fontSize: 12,
+    marginLeft: 2,
+  },
+  startLabel: {
+    color: '#F5DEB3',
+    fontSize: 17,
+    fontWeight: 'bold',
+    letterSpacing: 0.3,
+  },
+
+  // ── Section heading ──
+  sectionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 14,
+  },
+  sectionHeading: {
+    fontSize: 12,
+    fontWeight: 'bold',
+    color: '#5C3317',
+    letterSpacing: 1,
+  },
+  sectionLine: {
+    flex: 1,
+    height: 1,
+    backgroundColor: '#C8930A44',
+  },
+
+  // ── Game card ──
+  card: {
+    backgroundColor: '#fff8e8',
+    borderWidth: 1.5,
+    borderColor: '#C8930A55',
+    borderRadius: 14,
+    padding: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    shadowColor: '#2C1810',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+  avatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: '#2C1810',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarText: {
+    color: '#F5DEB3',
+    fontSize: 15,
+    fontWeight: 'bold',
+  },
+  cardInfo: {
+    flex: 1,
+    gap: 4,
+  },
+  opponentName: {
+    fontSize: 15,
+    fontWeight: 'bold',
+    color: '#2C1810',
+  },
+  turnRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+  },
+  dot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  dotGreen: { backgroundColor: '#2a8a3e' },
+  dotGold:  { backgroundColor: '#9C7A50' },
+  turnLabel: {
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  turnGreen: { color: '#2a8a3e' },
+  turnGold:  { color: '#9C7A50' },
+  pips: {
+    flexDirection: 'row',
+    gap: 4,
+    marginTop: 2,
+  },
+  pip: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    borderWidth: 1.5,
+    borderColor: '#C8930A',
+  },
+  pipFilled: {
+    backgroundColor: '#C8930A',
+  },
+
+  // ── Resume button ──
+  resumeBtn: {
+    backgroundColor: '#C8930A',
+    borderRadius: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 14,
+  },
+  resumeBtnDisabled: {
+    backgroundColor: '#E8D4A0',
+  },
+  resumeText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: 'bold',
+  },
+  resumeTextDisabled: {
+    color: '#9C7A50',
+  },
+
+  // ── Empty state ──
+  empty: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    opacity: 0.6,
+  },
+  emptyIcon:  { fontSize: 40 },
+  emptyTitle: { fontSize: 15, fontWeight: 'bold', color: '#5C3317' },
+  emptySub:   { fontSize: 13, color: '#7a5c3a', textAlign: 'center' },
 });
