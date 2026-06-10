@@ -49,7 +49,7 @@ export function useGames(userId: string | undefined) {
     const summaries: GameSummary[] = activeRows
       .map(row => {
         const opp     = opponentRows?.find(o => o.game_id === row.game_id);
-        const profile = opp?.profiles as { username: string | null } | null;
+        const profile = (opp?.profiles as unknown) as { username: string | null } | null;
         const oppName = profile?.username ?? (opp ? `Player ${opp.player_id.slice(-4).toUpperCase()}` : 'Waiting...');
 
         return {
