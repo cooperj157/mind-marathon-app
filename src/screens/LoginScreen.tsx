@@ -13,8 +13,9 @@ export default function LoginScreen() {
   const [debug, setDebug]     = useState('');
 
   async function handleSubmit() {
+    setDebug('tapped');
     if (!email || !password) {
-      Alert.alert('Missing fields', 'Please enter your email and password.');
+      setDebug('missing fields');
       return;
     }
     setLoading(true);
