@@ -10,6 +10,7 @@ export default function LoginScreen() {
   const [email, setEmail]     = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [debug, setDebug]     = useState('');
 
   async function handleSubmit() {
     if (!email || !password) {
@@ -24,7 +25,7 @@ export default function LoginScreen() {
       } else {
         const { data, error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
-        Alert.alert('Debug', `session: ${data.session ? 'YES' : 'NULL'}\nuser: ${data.user?.id ?? 'null'}`);
+        setDebug(`session:${data.session ? 'YES' : 'NULL'} user:${data.user?.id?.slice(0,8) ?? 'null'}`);
       }
     } catch (err: any) {
       Alert.alert('Error', err.message);
@@ -81,6 +82,8 @@ export default function LoginScreen() {
           onChangeText={setPassword}
           secureTextEntry
         />
+
+        {!!debug && <Text style={{ color: 'red', fontSize: 12, textAlign: 'center' }}>{debug}</Text>}
 
         {/* Submit */}
         <TouchableOpacity style={styles.button} onPress={handleSubmit} disabled={loading}>
