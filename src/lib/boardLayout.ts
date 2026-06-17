@@ -22,11 +22,23 @@ export const CATEGORY_COLORS: Record<Category, string> = {
   art_lit:       '#2C1810',
 };
 
+// A square is either a trivia category or a free "roll again" space.
+export type SquareKind = Category | 'roll_again';
+
+// ─────────────────────────────────────────────────────────────
+// BOARD LAYOUT
+// A Trivial-Pursuit-style wheel:
+//   • center hub (start / roll-again)
+//   • 6 spokes radiating out, each with 2 regular squares (inner, mid)
+//   • a 12-square outer ring: 6 "hub" squares (one per category — the
+//     checkpoints) at the spoke ends, with 1 square between each pair.
+// The 6 hub categories are always distinct so every checkpoint is a
+// different pie wedge. Win the game by earning 4 of the 6 wedges.
+// ─────────────────────────────────────────────────────────────
 export interface BoardLayout {
-  // 6 spokes from center, each with 3 category squares
-  spokes: Category[][];
-  // 12 category squares on outer ring (2 per checkpoint segment)
-  ring: Category[];
+  hubs:     Category[];     // [6]  distinct — checkpoint squares, one per spoke/ring junction
+  spokes:   Category[][];   // [6][2]  inner + mid squares between center and each hub
+  betweens: SquareKind[];   // [6]  the square sitting between hub i and hub i+1
 }
 
 function shuffle<T>(arr: T[]): T[] {
@@ -39,20 +51,22 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 export function generateBoardLayout(): BoardLayout {
-  // 18 spoke squares: 3 of each category, shuffled
-  const spokePool = shuffle([...CATEGORIES, ...CATEGORIES, ...CATEGORIES]) as Category[];
-  // 12 ring squares: 2 of each category, shuffled
-  const ringPool  = shuffle([...CATEGORIES, ...CATEGORIES]) as Category[];
+  // 6 distinct checkpoint categories, one per spoke/ring junction.
+  const hubs = shuffle([...CATEGORIES]) as Category[];
 
-  return {
-    spokes: [
-      spokePool.slice(0, 3),
-      spokePool.slice(3, 6),
-      spokePool.slice(6, 9),
-      spokePool.slice(9, 12),
-      spokePool.slice(12, 15),
-      spokePool.slice(15, 18),
-    ],
-    ring: ringPool,
-  };
+  // Each spoke gets 2 regular category squares (inner, mid).
+  const spokePool = shuffle([...CATEGORIES, ...CATEGORIES]) as Category[];
+  const spokes = Array.from({ length: 6 }, (_, i) => [
+    spokePool[i * 2],
+    spokePool[i * 2 + 1],
+  ]);
+
+  // 6 between-hub ring squares: 4 categories + 2 roll-again, shuffled.
+  const betweenPool = shuffle([
+    ...shuffle([...CATEGORIES]).slice(0, 4),
+    'roll_again',
+    'roll_again',
+  ]) as SquareKind[];
+
+  return { hubs, spokes, betweens: betweenPool };
 }

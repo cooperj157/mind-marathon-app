@@ -1,35 +1,31 @@
 import React, { useState } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
-  StyleSheet, ActivityIndicator, Alert, KeyboardAvoidingView, Platform,
+  StyleSheet, ActivityIndicator, KeyboardAvoidingView, Platform,
 } from 'react-native';
 import { supabase } from '../lib/supabase';
 
 export default function LoginScreen() {
-  const [mode, setMode]       = useState<'signin' | 'signup'>('signin');
-  const [email, setEmail]     = useState('');
+  const [mode, setMode]         = useState<'signin' | 'signup'>('signin');
+  const [email, setEmail]       = useState('');
   const [password, setPassword] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [debug, setDebug]     = useState('');
+  const [loading, setLoading]   = useState(false);
+  const [error, setError]       = useState('');
 
   async function handleSubmit() {
-    setDebug('tapped');
-    if (!email || !password) {
-      setDebug('missing fields');
-      return;
-    }
+    if (!email || !password) { setError('Please fill in all fields.'); return; }
     setLoading(true);
+    setError('');
     try {
       if (mode === 'signin') {
         const { error } = await supabase.auth.signInWithPassword({ email, password });
         if (error) throw error;
       } else {
-        const { data, error } = await supabase.auth.signUp({ email, password });
+        const { error } = await supabase.auth.signUp({ email, password });
         if (error) throw error;
-        setDebug(`session:${data.session ? 'YES' : 'NULL'} user:${data.user?.id?.slice(0,8) ?? 'null'}`);
       }
     } catch (err: any) {
-      Alert.alert('Error', err.message);
+      setError(err.message);
     } finally {
       setLoading(false);
     }
@@ -84,7 +80,7 @@ export default function LoginScreen() {
           secureTextEntry
         />
 
-        {!!debug && <Text style={{ color: 'red', fontSize: 12, textAlign: 'center' }}>{debug}</Text>}
+        {!!error && <Text style={styles.errorText}>{error}</Text>}
 
         {/* Submit */}
         <TouchableOpacity style={styles.button} onPress={handleSubmit} disabled={loading}>
@@ -118,4 +114,5 @@ const styles = StyleSheet.create({
     paddingVertical: 16, alignItems: 'center', marginTop: 6,
   },
   buttonText:      { color: '#F5DEB3', fontSize: 17, fontWeight: 'bold', letterSpacing: 0.5 },
+  errorText:       { color: '#C0392B', fontSize: 13, textAlign: 'center', marginBottom: 8 },
 });
