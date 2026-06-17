@@ -3,7 +3,7 @@ import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
 const SUPABASE_URL = 'https://cwmacxbjptrctetwwmgv.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNjE3NDQyLCJleHAiOjIwOTY5Nzc0NDJ9.63sQD8DHykkGh-ozylJBHtzzPv3WFZOMhlSYuu8d7SQ';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNzE5NDAzLCJleHAiOjIwOTcwNzk0MDN9.2PYuoGTX5WE2sWL5VG0kri9zOlcLV9bCImNDkuPvLLQ';
 
 const secureStoreAdapter = {
   getItem:    (key: string) => SecureStore.getItemAsync(key),
