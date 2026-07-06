@@ -1,5 +1,5 @@
-import React, { useEffect, useState, useCallback } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
+import React, { useCallback, useEffect, useState } from 'react';
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 
@@ -7,12 +7,13 @@ import { supabase } from '../lib/supabase';
 import { useAuth } from '../hooks/useAuth';
 import { RootStackParamList } from '../../App';
 import BoardView, { PawnInfo } from '../components/BoardView';
+import QuestionModal, { QuestionData } from '../components/QuestionModal';
 import { BoardLayout, generateBoardLayout, CATEGORIES, CATEGORY_COLORS } from '../lib/boardLayout';
-import { CENTER } from '../lib/board';
+import { Position, CENTER, legalDestinations, squareAt } from '../lib/board';
 
 type Props = NativeStackScreenProps<RootStackParamList, 'Game'>;
 
-const WIN_WEDGES = 4;
+const WIN_WEDGES    = 4;
 const PLAYER_COLORS = ['#C0392B', '#4A90D9', '#27AE60', '#8E44AD'];
 
 interface PlayerRow {
@@ -24,7 +25,6 @@ interface PlayerRow {
   username:            string | null;
 }
 
-// The pre-checkpoint layout shape lacked `hubs`/`betweens`.
 function isValidLayout(l: any): l is BoardLayout {
   return l && Array.isArray(l.hubs) && Array.isArray(l.spokes) && Array.isArray(l.betweens);
 }
@@ -36,49 +36,80 @@ function initials(name: string | null, fallback: string): string {
 
 export default function GameScreen({ route }: Props) {
   const { gameId } = route.params;
-  const { user } = useAuth();
+  const { user }   = useAuth();
 
-  const [layout, setLayout]   = useState<BoardLayout | null>(null);
+  const [layout,  setLayout]  = useState<BoardLayout | null>(null);
   const [players, setPlayers] = useState<PlayerRow[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // turn state
+  const [rollResult,      setRollResult]      = useState<number | null>(null);
+  const [legalMoves,      setLegalMoves]      = useState<Position[]>([]);
+  const [pendingMove,     setPendingMove]      = useState<{ from: Position; to: Position } | null>(null);
+  const [activeQuestion,  setActiveQuestion]   = useState<QuestionData | null>(null);
+  const [isProcessing,    setIsProcessing]     = useState(false);
+  const [winnerName,      setWinnerName]       = useState<string | null>(null);
+  const [gameStatus,      setGameStatus]       = useState<string>('waiting');
+
   const load = useCallback(async () => {
-    // 1 — game + board layout
     const { data: game } = await supabase
       .from('games')
-      .select('id, board_layout')
+      .select('id, board_layout, status, winner_id')
       .eq('id', gameId)
       .single();
 
     let boardLayout = game?.board_layout;
     if (!isValidLayout(boardLayout)) {
-      // Heal a game created before checkpoints existed.
       boardLayout = generateBoardLayout();
       await supabase.from('games').update({ board_layout: boardLayout }).eq('id', gameId);
     }
     setLayout(boardLayout);
 
-    // 2 — players
     const { data: rows } = await supabase
       .from('game_players')
       .select('player_id, position, checkpoints_cleared, turn_order, is_current_turn, profiles(username)')
       .eq('game_id', gameId)
       .order('turn_order');
 
-    setPlayers((rows ?? []).map(r => ({
+    const mapped: PlayerRow[] = (rows ?? []).map(r => ({
       player_id:           r.player_id,
       position:            r.position ?? CENTER,
       checkpoints_cleared: r.checkpoints_cleared ?? [],
       turn_order:          r.turn_order,
       is_current_turn:     r.is_current_turn,
       username:            ((r.profiles as unknown) as { username: string | null } | null)?.username ?? null,
-    })));
+    }));
+    setPlayers(mapped);
+
+    setGameStatus(game?.status ?? 'waiting');
+
+    if (game?.status === 'completed' && game.winner_id) {
+      const winner = mapped.find(p => p.player_id === game.winner_id);
+      setWinnerName(winner?.username ?? 'A player');
+    }
 
     setLoading(false);
   }, [gameId]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
   useEffect(() => { load(); }, [load]);
+
+  // Realtime: re-fetch whenever this game's rows change
+  useEffect(() => {
+    const channel = supabase
+      .channel(`game:${gameId}`)
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'game_players',
+        filter: `game_id=eq.${gameId}`,
+      }, () => load())
+      .on('postgres_changes', {
+        event: '*', schema: 'public', table: 'games',
+        filter: `id=eq.${gameId}`,
+      }, () => load())
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [gameId, load]);
 
   if (loading || !layout) {
     return (
@@ -88,7 +119,7 @@ export default function GameScreen({ route }: Props) {
     );
   }
 
-  const me   = players.find(p => p.player_id === user?.id);
+  const me     = players.find(p => p.player_id === user?.id);
   const myTurn = !!me?.is_current_turn;
 
   const pawns: PawnInfo[] = players.map(p => ({
@@ -97,37 +128,176 @@ export default function GameScreen({ route }: Props) {
     label:    initials(p.username, `P${p.turn_order}`),
   }));
 
+  // ── Roll ────────────────────────────────────────────────────
+  function handleRoll() {
+    if (!me || isProcessing || rollResult !== null) return;
+    const roll  = Math.ceil(Math.random() * 6);
+    const moves = legalDestinations(me.position, roll);
+    setRollResult(roll);
+    setLegalMoves(moves);
+  }
+
+  // ── Move chosen ─────────────────────────────────────────────
+  async function handleSquarePress(pos: Position) {
+    if (!me || !legalMoves.includes(pos) || isProcessing) return;
+    setIsProcessing(true);
+    setLegalMoves([]);
+
+    const fromPos = me.position;
+
+    await supabase
+      .from('game_players')
+      .update({ position: pos })
+      .eq('game_id', gameId)
+      .eq('player_id', user!.id);
+
+    const sq = squareAt(layout!, pos);
+
+    if (sq.kind === 'roll_again' || sq.kind === 'start') {
+      await supabase.from('turns').insert({
+        game_id: gameId, player_id: user!.id,
+        from_position: fromPos, to_position: pos,
+      });
+      await supabase.rpc('end_turn', { p_game_id: gameId });
+      setRollResult(null);
+      await load();
+      setIsProcessing(false);
+      return;
+    }
+
+    // category square — fetch a question
+    const { data } = await supabase.rpc('random_question', { p_category: sq.category });
+    const question = (data as QuestionData[] | null)?.[0] ?? null;
+
+    if (!question) {
+      // No questions seeded yet — treat as roll_again
+      await supabase.from('turns').insert({
+        game_id: gameId, player_id: user!.id,
+        from_position: fromPos, to_position: pos,
+      });
+      await supabase.rpc('end_turn', { p_game_id: gameId });
+      setRollResult(null);
+      await load();
+      setIsProcessing(false);
+      return;
+    }
+
+    setPendingMove({ from: fromPos, to: pos });
+    setActiveQuestion(question);
+    setIsProcessing(false);
+  }
+
+  // ── Answer submitted ─────────────────────────────────────────
+  async function handleAnswer(correct: boolean) {
+    if (!me || !pendingMove || !activeQuestion) return;
+    setIsProcessing(true);
+    setActiveQuestion(null);
+
+    const sq = squareAt(layout!, pendingMove.to);
+    const isCheckpoint = sq.kind === 'category' && sq.checkpoint;
+
+    await supabase.from('turns').insert({
+      game_id:            gameId,
+      player_id:          user!.id,
+      from_position:      pendingMove.from,
+      to_position:        pendingMove.to,
+      question_id:        activeQuestion.id,
+      answered_correctly: correct,
+    });
+
+    let won = false;
+    if (correct && isCheckpoint && sq.kind === 'category') {
+      const newCheckpoints = [...new Set([...me.checkpoints_cleared, sq.category])];
+      await supabase
+        .from('game_players')
+        .update({ checkpoints_cleared: newCheckpoints })
+        .eq('game_id', gameId)
+        .eq('player_id', user!.id);
+
+      if (newCheckpoints.length >= WIN_WEDGES) {
+        await supabase.rpc('declare_winner', { p_game_id: gameId, p_player_id: user!.id });
+        setWinnerName(me.username ?? 'You');
+        won = true;
+      }
+    }
+
+    if (!won) {
+      await supabase.rpc('end_turn', { p_game_id: gameId });
+    }
+
+    setPendingMove(null);
+    setRollResult(null);
+    await load();
+    setIsProcessing(false);
+  }
+
+  // ── Render ──────────────────────────────────────────────────
   return (
     <View style={styles.container}>
-      {/* Scoreboard — wedges per player */}
+      {winnerName && (
+        <View style={styles.winnerBanner}>
+          <Text style={styles.winnerText}>
+            {winnerName === 'You' || winnerName === me?.username ? '🏆 You win!' : `${winnerName} wins!`}
+          </Text>
+        </View>
+      )}
+
       <View style={styles.scoreboard}>
         {players.map(p => (
-          <View key={p.player_id} style={styles.scoreCard}>
+          <View
+            key={p.player_id}
+            style={[styles.scoreCard, p.is_current_turn && styles.scoreCardActive]}
+          >
             <View style={[styles.scoreDot, { backgroundColor: PLAYER_COLORS[(p.turn_order - 1) % PLAYER_COLORS.length] }]} />
             <Text style={styles.scoreName} numberOfLines={1}>
-              {p.player_id === user?.id ? 'You' : (p.username ?? `Player ${p.turn_order}`)}
+              {p.player_id === user?.id ? 'You' : (p.username ?? `P${p.turn_order}`)}
             </Text>
             <Wedges cleared={p.checkpoints_cleared} />
           </View>
         ))}
       </View>
 
-      {/* The board */}
       <View style={styles.boardWrap}>
-        <BoardView layout={layout} pawns={pawns} />
+        <BoardView
+          layout={layout}
+          pawns={pawns}
+          legalMoves={myTurn ? legalMoves : []}
+          onSquarePress={myTurn ? handleSquarePress : undefined}
+        />
       </View>
 
-      {/* Turn banner (roll button arrives in the next step) */}
       <View style={styles.footer}>
-        <Text style={[styles.turnText, myTurn ? styles.turnMine : styles.turnTheirs]}>
-          {myTurn ? 'Your turn — tap to roll (coming next)' : 'Waiting for opponent…'}
-        </Text>
+        {winnerName ? null : gameStatus === 'waiting' ? (
+          <Text style={styles.waitingText}>Waiting for opponent to join…</Text>
+        ) : myTurn ? (
+          rollResult === null ? (
+            <TouchableOpacity
+              style={[styles.rollBtn, isProcessing && styles.rollBtnDisabled]}
+              onPress={handleRoll}
+              disabled={isProcessing}
+            >
+              <Text style={styles.rollBtnText}>Roll Dice</Text>
+            </TouchableOpacity>
+          ) : (
+            <View style={styles.rollResult}>
+              <Text style={styles.rollResultDie}>🎲 {rollResult}</Text>
+              <Text style={styles.rollResultHint}>
+                {legalMoves.length > 0 ? 'Tap a highlighted square to move' : 'No moves available…'}
+              </Text>
+            </View>
+          )
+        ) : (
+          <Text style={styles.waitingText}>Waiting for opponent…</Text>
+        )}
       </View>
+
+      {activeQuestion && (
+        <QuestionModal question={activeQuestion} onAnswer={handleAnswer} />
+      )}
     </View>
   );
 }
 
-// Six little category dots; filled when that wedge is earned.
 function Wedges({ cleared }: { cleared: string[] }) {
   const has = new Set(cleared);
   return (
@@ -150,20 +320,30 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F4E4BC', padding: 16 },
   center:    { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F4E4BC' },
 
+  winnerBanner: {
+    backgroundColor: '#C8930A', borderRadius: 12, padding: 12, marginBottom: 10, alignItems: 'center',
+  },
+  winnerText: { fontSize: 20, fontWeight: 'bold', color: '#fff' },
+
   scoreboard: { flexDirection: 'row', gap: 10, marginBottom: 12 },
   scoreCard: {
     flex: 1, backgroundColor: '#fff8e8', borderRadius: 12, padding: 10,
     borderWidth: 1.5, borderColor: '#C8930A55', gap: 6,
   },
-  scoreDot:  { width: 10, height: 10, borderRadius: 5 },
-  scoreName: { fontSize: 13, fontWeight: 'bold', color: '#2C1810' },
-  wedges:    { flexDirection: 'row', gap: 3, flexWrap: 'wrap' },
-  wedge:     { width: 9, height: 9, borderRadius: 5, borderWidth: 1.5 },
+  scoreCardActive: { borderColor: '#2a8a3e', borderWidth: 2 },
+  scoreDot:   { width: 10, height: 10, borderRadius: 5 },
+  scoreName:  { fontSize: 13, fontWeight: 'bold', color: '#2C1810' },
+  wedges:     { flexDirection: 'row', gap: 3, flexWrap: 'wrap' },
+  wedge:      { width: 9, height: 9, borderRadius: 5, borderWidth: 1.5 },
 
   boardWrap: { flex: 1, aspectRatio: 1, alignSelf: 'center', width: '100%', maxWidth: 420 },
 
-  footer:    { paddingTop: 12, alignItems: 'center' },
-  turnText:  { fontSize: 15, fontWeight: 'bold' },
-  turnMine:  { color: '#2a8a3e' },
-  turnTheirs:{ color: '#9C7A50' },
+  footer:       { paddingTop: 12, alignItems: 'center' },
+  rollBtn:      { backgroundColor: '#2C1810', borderRadius: 16, paddingVertical: 14, paddingHorizontal: 48 },
+  rollBtnDisabled: { opacity: 0.5 },
+  rollBtnText:  { color: '#F4E4BC', fontSize: 18, fontWeight: 'bold' },
+  rollResult:   { alignItems: 'center', gap: 6 },
+  rollResultDie:  { fontSize: 32 },
+  rollResultHint: { fontSize: 14, color: '#5C3317' },
+  waitingText:  { fontSize: 15, fontWeight: 'bold', color: '#9C7A50' },
 });
