@@ -50,17 +50,16 @@ alter table public.games enable row level security;
 
 -- ─────────────────────────────────────────────────────────────
 -- GAME PLAYERS
--- One row per player per game. Tracks position, health,
--- which checkpoints they've cleared, and whose turn it is.
+-- One row per player per game. Tracks position, which checkpoints
+-- they've cleared, and whose turn it is.
 -- ─────────────────────────────────────────────────────────────
 create table public.game_players (
   id                  uuid primary key default gen_random_uuid(),
   game_id             uuid not null references public.games(id) on delete cascade,
   player_id           uuid not null references public.profiles(id) on delete cascade,
   position            text not null default 'center',
-  health              integer not null default 3 check (health >= 0),
   checkpoints_cleared text[] not null default '{}',
-  turn_order          integer not null check (turn_order between 1 and 4),
+  turn_order          integer not null check (turn_order between 1 and 2),
   is_current_turn     boolean not null default false,
   joined_at           timestamptz default now(),
   unique (game_id, player_id),
@@ -98,6 +97,18 @@ create policy "Players can view game_players in their games"
 create policy "Players can update their own game_player row"
   on public.game_players for update
   using (player_id = auth.uid());
+
+-- Games: a player can cancel their own game while it's still waiting
+-- for an opponent (no opponent has joined yet).
+create policy "Players can cancel their own waiting game"
+  on public.games for delete
+  using (
+    status = 'waiting'
+    and exists (
+      select 1 from public.game_players
+      where game_id = games.id and player_id = auth.uid()
+    )
+  );
 
 -- ─────────────────────────────────────────────────────────────
 -- QUESTIONS

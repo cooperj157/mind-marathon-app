@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity, Alert, Animated } from 'react-native';
 import { NativeStackScreenProps } from '@react-navigation/native-stack';
 import { useFocusEffect } from '@react-navigation/native';
 
@@ -14,7 +14,7 @@ import { Position, CENTER, legalDestinations, squareAt } from '../lib/board';
 type Props = NativeStackScreenProps<RootStackParamList, 'Game'>;
 
 const WIN_WEDGES    = 4;
-const PLAYER_COLORS = ['#C0392B', '#4A90D9', '#27AE60', '#8E44AD'];
+const PLAYER_COLORS = ['#C0392B', '#4A90D9'];
 
 interface PlayerRow {
   player_id:           string;
@@ -44,6 +44,8 @@ export default function GameScreen({ route }: Props) {
 
   // turn state
   const [rollResult,      setRollResult]      = useState<number | null>(null);
+  const [rolling,         setRolling]         = useState(false);
+  const [displayFace,     setDisplayFace]     = useState<number | null>(null);
   const [legalMoves,      setLegalMoves]      = useState<Position[]>([]);
   const [pendingMove,     setPendingMove]      = useState<{ from: Position; to: Position } | null>(null);
   const [activeQuestion,  setActiveQuestion]   = useState<QuestionData | null>(null);
@@ -122,19 +124,59 @@ export default function GameScreen({ route }: Props) {
   const me     = players.find(p => p.player_id === user?.id);
   const myTurn = !!me?.is_current_turn;
 
+  const activeAnim = useRef<Record<string, Animated.Value>>({}).current;
+  function animForPlayer(id: string, active: boolean): Animated.Value {
+    if (!activeAnim[id]) activeAnim[id] = new Animated.Value(active ? 1 : 0);
+    return activeAnim[id];
+  }
+
+  useEffect(() => {
+    players.forEach(p => {
+      Animated.timing(animForPlayer(p.player_id, p.is_current_turn), {
+        toValue: p.is_current_turn ? 1 : 0,
+        duration: 250,
+        useNativeDriver: false,
+      }).start();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [players]);
+
   const pawns: PawnInfo[] = players.map(p => ({
+    id:       p.player_id,
     position: p.position,
     color:    PLAYER_COLORS[(p.turn_order - 1) % PLAYER_COLORS.length],
     label:    initials(p.username, `P${p.turn_order}`),
   }));
 
+  // ── Error handling ──────────────────────────────────────────
+  // Any failed write means local state may no longer match the DB, so the
+  // one safe recovery is to resync via load() rather than guess at a fix.
+  async function checkError(result: PromiseLike<{ error: any }>, message: string): Promise<boolean> {
+    const { error } = await result;
+    if (error) {
+      console.error(message, error);
+      Alert.alert('Sync error', message);
+    }
+    return !error;
+  }
+
   // ── Roll ────────────────────────────────────────────────────
   function handleRoll() {
-    if (!me || isProcessing || rollResult !== null) return;
-    const roll  = Math.ceil(Math.random() * 6);
-    const moves = legalDestinations(me.position, roll);
-    setRollResult(roll);
-    setLegalMoves(moves);
+    if (!me || isProcessing || rollResult !== null || rolling) return;
+    const finalRoll = Math.ceil(Math.random() * 6);
+    setRolling(true);
+    let ticks = 0;
+    const interval = setInterval(() => {
+      setDisplayFace(1 + Math.floor(Math.random() * 6));
+      ticks++;
+      if (ticks >= 8) {
+        clearInterval(interval);
+        setDisplayFace(finalRoll);
+        setRollResult(finalRoll);
+        setLegalMoves(legalDestinations(me.position, finalRoll));
+        setRolling(false);
+      }
+    }, 70);
   }
 
   // ── Move chosen ─────────────────────────────────────────────
@@ -145,20 +187,30 @@ export default function GameScreen({ route }: Props) {
 
     const fromPos = me.position;
 
-    await supabase
-      .from('game_players')
-      .update({ position: pos })
-      .eq('game_id', gameId)
-      .eq('player_id', user!.id);
+    const movedOk = await checkError(
+      supabase.from('game_players').update({ position: pos }).eq('game_id', gameId).eq('player_id', user!.id),
+      'Could not save your move. The board has been refreshed — please try again.',
+    );
+    if (!movedOk) { await load(); setIsProcessing(false); return; }
 
     const sq = squareAt(layout!, pos);
 
     if (sq.kind === 'roll_again' || sq.kind === 'start') {
-      await supabase.from('turns').insert({
-        game_id: gameId, player_id: user!.id,
-        from_position: fromPos, to_position: pos,
-      });
-      await supabase.rpc('end_turn', { p_game_id: gameId });
+      const turnOk = await checkError(
+        supabase.from('turns').insert({
+          game_id: gameId, player_id: user!.id,
+          from_position: fromPos, to_position: pos,
+        }),
+        'Could not log your move. The board has been refreshed — please try again.',
+      );
+      if (!turnOk) { await load(); setIsProcessing(false); return; }
+
+      const endOk = await checkError(
+        supabase.rpc('end_turn', { p_game_id: gameId }),
+        'Could not end your turn. The board has been refreshed — please try again.',
+      );
+      if (!endOk) { await load(); setIsProcessing(false); return; }
+
       setRollResult(null);
       await load();
       setIsProcessing(false);
@@ -166,16 +218,32 @@ export default function GameScreen({ route }: Props) {
     }
 
     // category square — fetch a question
-    const { data } = await supabase.rpc('random_question', { p_category: sq.category });
+    const { data, error: questionErr } = await supabase.rpc('random_question', { p_category: sq.category });
+    if (questionErr) {
+      Alert.alert('Sync error', 'Could not fetch a question. The board has been refreshed — please try again.');
+      await load();
+      setIsProcessing(false);
+      return;
+    }
     const question = (data as QuestionData[] | null)?.[0] ?? null;
 
     if (!question) {
       // No questions seeded yet — treat as roll_again
-      await supabase.from('turns').insert({
-        game_id: gameId, player_id: user!.id,
-        from_position: fromPos, to_position: pos,
-      });
-      await supabase.rpc('end_turn', { p_game_id: gameId });
+      const turnOk = await checkError(
+        supabase.from('turns').insert({
+          game_id: gameId, player_id: user!.id,
+          from_position: fromPos, to_position: pos,
+        }),
+        'Could not log your move. The board has been refreshed — please try again.',
+      );
+      if (!turnOk) { await load(); setIsProcessing(false); return; }
+
+      const endOk = await checkError(
+        supabase.rpc('end_turn', { p_game_id: gameId }),
+        'Could not end your turn. The board has been refreshed — please try again.',
+      );
+      if (!endOk) { await load(); setIsProcessing(false); return; }
+
       setRollResult(null);
       await load();
       setIsProcessing(false);
@@ -196,33 +264,73 @@ export default function GameScreen({ route }: Props) {
     const sq = squareAt(layout!, pendingMove.to);
     const isCheckpoint = sq.kind === 'category' && sq.checkpoint;
 
-    await supabase.from('turns').insert({
-      game_id:            gameId,
-      player_id:          user!.id,
-      from_position:      pendingMove.from,
-      to_position:        pendingMove.to,
-      question_id:        activeQuestion.id,
-      answered_correctly: correct,
-    });
+    const turnOk = await checkError(
+      supabase.from('turns').insert({
+        game_id:            gameId,
+        player_id:          user!.id,
+        from_position:      pendingMove.from,
+        to_position:        pendingMove.to,
+        question_id:        activeQuestion.id,
+        answered_correctly: correct,
+      }),
+      'Could not log your answer. The board has been refreshed — please try again.',
+    );
+    if (!turnOk) {
+      await load();
+      setPendingMove(null);
+      setRollResult(null);
+      setIsProcessing(false);
+      return;
+    }
 
     let won = false;
     if (correct && isCheckpoint && sq.kind === 'category') {
       const newCheckpoints = [...new Set([...me.checkpoints_cleared, sq.category])];
-      await supabase
-        .from('game_players')
-        .update({ checkpoints_cleared: newCheckpoints })
-        .eq('game_id', gameId)
-        .eq('player_id', user!.id);
+      const checkpointOk = await checkError(
+        supabase
+          .from('game_players')
+          .update({ checkpoints_cleared: newCheckpoints })
+          .eq('game_id', gameId)
+          .eq('player_id', user!.id),
+        'Could not save your checkpoint. The board has been refreshed — please try again.',
+      );
+      if (!checkpointOk) {
+        await load();
+        setPendingMove(null);
+        setRollResult(null);
+        setIsProcessing(false);
+        return;
+      }
 
       if (newCheckpoints.length >= WIN_WEDGES) {
-        await supabase.rpc('declare_winner', { p_game_id: gameId, p_player_id: user!.id });
+        const winOk = await checkError(
+          supabase.rpc('declare_winner', { p_game_id: gameId, p_player_id: user!.id }),
+          'Could not record your win. The board has been refreshed — please try again.',
+        );
+        if (!winOk) {
+          await load();
+          setPendingMove(null);
+          setRollResult(null);
+          setIsProcessing(false);
+          return;
+        }
         setWinnerName(me.username ?? 'You');
         won = true;
       }
     }
 
     if (!won) {
-      await supabase.rpc('end_turn', { p_game_id: gameId });
+      const endOk = await checkError(
+        supabase.rpc('end_turn', { p_game_id: gameId }),
+        'Could not end your turn. The board has been refreshed — please try again.',
+      );
+      if (!endOk) {
+        await load();
+        setPendingMove(null);
+        setRollResult(null);
+        setIsProcessing(false);
+        return;
+      }
     }
 
     setPendingMove(null);
@@ -243,18 +351,27 @@ export default function GameScreen({ route }: Props) {
       )}
 
       <View style={styles.scoreboard}>
-        {players.map(p => (
-          <View
-            key={p.player_id}
-            style={[styles.scoreCard, p.is_current_turn && styles.scoreCardActive]}
-          >
-            <View style={[styles.scoreDot, { backgroundColor: PLAYER_COLORS[(p.turn_order - 1) % PLAYER_COLORS.length] }]} />
-            <Text style={styles.scoreName} numberOfLines={1}>
-              {p.player_id === user?.id ? 'You' : (p.username ?? `P${p.turn_order}`)}
-            </Text>
-            <Wedges cleared={p.checkpoints_cleared} />
-          </View>
-        ))}
+        {players.map(p => {
+          const anim = animForPlayer(p.player_id, p.is_current_turn);
+          return (
+            <Animated.View
+              key={p.player_id}
+              style={[
+                styles.scoreCard,
+                {
+                  borderColor: anim.interpolate({ inputRange: [0, 1], outputRange: ['#C8930A55', '#2a8a3e'] }),
+                  borderWidth: anim.interpolate({ inputRange: [0, 1], outputRange: [1.5, 2] }),
+                },
+              ]}
+            >
+              <View style={[styles.scoreDot, { backgroundColor: PLAYER_COLORS[(p.turn_order - 1) % PLAYER_COLORS.length] }]} />
+              <Text style={styles.scoreName} numberOfLines={1}>
+                {p.player_id === user?.id ? 'You' : (p.username ?? `P${p.turn_order}`)}
+              </Text>
+              <Wedges cleared={p.checkpoints_cleared} />
+            </Animated.View>
+          );
+        })}
       </View>
 
       <View style={styles.boardWrap}>
@@ -270,7 +387,7 @@ export default function GameScreen({ route }: Props) {
         {winnerName ? null : gameStatus === 'waiting' ? (
           <Text style={styles.waitingText}>Waiting for opponent to join…</Text>
         ) : myTurn ? (
-          rollResult === null ? (
+          rollResult === null && !rolling ? (
             <TouchableOpacity
               style={[styles.rollBtn, isProcessing && styles.rollBtnDisabled]}
               onPress={handleRoll}
@@ -278,6 +395,11 @@ export default function GameScreen({ route }: Props) {
             >
               <Text style={styles.rollBtnText}>Roll Dice</Text>
             </TouchableOpacity>
+          ) : rolling ? (
+            <View style={styles.rollResult}>
+              <Text style={styles.rollResultDie}>🎲 {displayFace}</Text>
+              <Text style={styles.rollResultHint}>Rolling…</Text>
+            </View>
           ) : (
             <View style={styles.rollResult}>
               <Text style={styles.rollResultDie}>🎲 {rollResult}</Text>

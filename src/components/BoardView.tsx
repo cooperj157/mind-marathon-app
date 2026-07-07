@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
+import { Animated } from 'react-native';
 import Svg, { Circle, Line, G, Text as SvgText } from 'react-native-svg';
 
 import { BoardLayout, CATEGORY_COLORS } from '../lib/boardLayout';
@@ -35,9 +36,33 @@ function coordsFor(pos: Position): { x: number; y: number } {
 }
 
 export interface PawnInfo {
+  id:       string;   // stable identity across renders (player_id)
   position: Position;
   color:    string;
   label:    string;   // initials shown on the pawn
+}
+
+const AnimatedCircle = Animated.createAnimatedComponent(Circle);
+
+function AnimatedPawn({ pawn, target }: { pawn: PawnInfo; target: { x: number; y: number } }) {
+  const anim = useRef(new Animated.ValueXY(target)).current;
+  const prevPos = useRef(pawn.position);
+
+  useEffect(() => {
+    if (prevPos.current !== pawn.position) {
+      Animated.timing(anim, { toValue: target, duration: 350, useNativeDriver: false }).start();
+      prevPos.current = pawn.position;
+    } else {
+      anim.setValue(target);
+    }
+  }, [pawn.position, target.x, target.y]);
+
+  return (
+    <G>
+      <AnimatedCircle cx={anim.x} cy={anim.y} r={R_PAWN + 1.5} fill="#fff8e8" />
+      <AnimatedCircle cx={anim.x} cy={anim.y} r={R_PAWN} fill={pawn.color} />
+    </G>
+  );
 }
 
 interface Props {
@@ -126,11 +151,11 @@ export default function BoardView({ layout, pawns, legalMoves = [], onSquarePres
         return group.map((p, idx) => {
           // fan multiple pawns on one square apart horizontally
           const offset = group.length > 1 ? (idx - (group.length - 1) / 2) * (R_PAWN * 1.6) : 0;
+          const target = { x: x + offset, y };
           return (
-            <G key={`pawn-${p.label}-${idx}`}>
-              <Circle cx={x + offset} cy={y} r={R_PAWN + 1.5} fill="#fff8e8" />
-              <Circle cx={x + offset} cy={y} r={R_PAWN} fill={p.color} />
-              <SvgText x={x + offset} y={y + 3} fontSize={8} fontWeight="bold" fill="#fff" textAnchor="middle">
+            <G key={`pawn-${p.id}`}>
+              <AnimatedPawn pawn={p} target={target} />
+              <SvgText x={target.x} y={target.y + 3} fontSize={8} fontWeight="bold" fill="#fff" textAnchor="middle">
                 {p.label}
               </SvgText>
             </G>

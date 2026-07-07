@@ -3,6 +3,7 @@ import { supabase } from '../lib/supabase';
 
 export interface GameSummary {
   gameId:               string;
+  status:               'active' | 'waiting';
   isMyTurn:             boolean;
   myCheckpoints:        string[];
   opponentId:           string | null;
@@ -26,15 +27,15 @@ export function useGames(userId: string | undefined) {
 
     if (!myRows?.length) { setGames([]); setLoading(false); return; }
 
-    // 2 — Keep only active games
-    const { data: activeGames } = await supabase
+    // 2 — Keep only active or waiting games (drop completed ones)
+    const { data: liveGames } = await supabase
       .from('games')
-      .select('id')
+      .select('id, status')
       .in('id', myRows.map(r => r.game_id))
-      .eq('status', 'active');
+      .in('status', ['active', 'waiting']);
 
-    const activeIds = new Set(activeGames?.map(g => g.id) ?? []);
-    const activeRows = myRows.filter(r => activeIds.has(r.game_id));
+    const statusById = new Map((liveGames ?? []).map(g => [g.id, g.status as 'active' | 'waiting']));
+    const activeRows = myRows.filter(r => statusById.has(r.game_id));
 
     if (!activeRows.length) { setGames([]); setLoading(false); return; }
 
@@ -54,6 +55,7 @@ export function useGames(userId: string | undefined) {
 
         return {
           gameId:              row.game_id,
+          status:              statusById.get(row.game_id)!,
           isMyTurn:            row.is_current_turn,
           myCheckpoints:       row.checkpoints_cleared ?? [],
           opponentId:          opp?.player_id ?? null,

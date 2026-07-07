@@ -39,31 +39,40 @@ export default function LobbyScreen({ navigation }: Props) {
     if (!user) return;
     setStarting(true);
     try {
-      // Look for a game in 'waiting' status that the current user hasn't joined
-      const { data: waitingGames } = await supabase
-        .from('games')
-        .select('id, game_players(player_id)')
-        .eq('status', 'waiting')
-        .limit(10);
-
-      const joinable = waitingGames?.find(g =>
-        !(g.game_players as { player_id: string }[]).some(p => p.player_id === user.id)
-      );
-
-      if (joinable) {
-        // Join the existing game as player 2
-        await supabase.from('game_players').insert({
-          game_id:         joinable.id,
-          player_id:       user.id,
-          turn_order:      2,
-          is_current_turn: false,
-        });
-        await supabase
+      for (let attempt = 0; attempt < 3; attempt++) {
+        // Look for a game in 'waiting' status that the current user hasn't joined
+        const { data: waitingGames } = await supabase
           .from('games')
-          .update({ status: 'active' })
-          .eq('id', joinable.id);
-        navigation.navigate('Game', { gameId: joinable.id });
-      } else {
+          .select('id, game_players(player_id)')
+          .eq('status', 'waiting')
+          .limit(10);
+
+        const joinable = waitingGames?.find(g =>
+          !(g.game_players as { player_id: string }[]).some(p => p.player_id === user.id)
+        );
+
+        if (joinable) {
+          // Join the existing game as player 2
+          const { error: joinErr } = await supabase.from('game_players').insert({
+            game_id:         joinable.id,
+            player_id:       user.id,
+            turn_order:      2,
+            is_current_turn: false,
+          });
+
+          if (joinErr) {
+            if (joinErr.code === '23505') continue; // someone else grabbed slot 2 — retry
+            throw joinErr;
+          }
+
+          await supabase
+            .from('games')
+            .update({ status: 'active' })
+            .eq('id', joinable.id);
+          navigation.navigate('Game', { gameId: joinable.id });
+          return;
+        }
+
         // No waiting game found — create a new one
         const { data: newGame, error } = await supabase
           .from('games')
@@ -80,7 +89,10 @@ export default function LobbyScreen({ navigation }: Props) {
           is_current_turn: true,
         });
         navigation.navigate('Game', { gameId: newGame.id });
+        return;
       }
+
+      Alert.alert('Error', 'Could not join a game right now — please try again.');
     } catch (err: any) {
       Alert.alert('Error', err?.message ?? 'Could not start game. Please try again.');
     } finally {
@@ -88,8 +100,15 @@ export default function LobbyScreen({ navigation }: Props) {
     }
   }
 
+  async function handleCancelGame(gameId: string) {
+    const { error } = await supabase.from('games').delete().eq('id', gameId);
+    if (error) { Alert.alert('Error', 'Could not cancel game.'); return; }
+    refetch();
+  }
+
   function renderGame({ item }: { item: GameSummary }) {
     const initials = getInitials(item.opponentName);
+    const isWaiting = item.status === 'waiting';
     return (
       <View style={styles.card}>
 
@@ -101,9 +120,9 @@ export default function LobbyScreen({ navigation }: Props) {
           <Text style={styles.opponentName} numberOfLines={1}>{item.opponentName}</Text>
 
           <View style={styles.turnRow}>
-            <View style={[styles.dot, item.isMyTurn ? styles.dotGreen : styles.dotGold]} />
-            <Text style={[styles.turnLabel, item.isMyTurn ? styles.turnGreen : styles.turnGold]}>
-              {item.isMyTurn ? 'Your turn' : 'Their turn'}
+            <View style={[styles.dot, isWaiting ? styles.dotGold : item.isMyTurn ? styles.dotGreen : styles.dotGold]} />
+            <Text style={[styles.turnLabel, isWaiting ? styles.turnGold : item.isMyTurn ? styles.turnGreen : styles.turnGold]}>
+              {isWaiting ? 'Waiting for opponent' : item.isMyTurn ? 'Your turn' : 'Their turn'}
             </Text>
           </View>
 
@@ -114,14 +133,23 @@ export default function LobbyScreen({ navigation }: Props) {
           </View>
         </View>
 
-        <TouchableOpacity
-          style={[styles.resumeBtn, !item.isMyTurn && styles.resumeBtnDisabled]}
-          onPress={() => navigation.navigate('Game', { gameId: item.gameId })}
-        >
-          <Text style={[styles.resumeText, !item.isMyTurn && styles.resumeTextDisabled]}>
-            Resume
-          </Text>
-        </TouchableOpacity>
+        {isWaiting ? (
+          <TouchableOpacity
+            style={styles.resumeBtn}
+            onPress={() => handleCancelGame(item.gameId)}
+          >
+            <Text style={styles.resumeText}>Cancel</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity
+            style={[styles.resumeBtn, !item.isMyTurn && styles.resumeBtnDisabled]}
+            onPress={() => navigation.navigate('Game', { gameId: item.gameId })}
+          >
+            <Text style={[styles.resumeText, !item.isMyTurn && styles.resumeTextDisabled]}>
+              Resume
+            </Text>
+          </TouchableOpacity>
+        )}
 
       </View>
     );
