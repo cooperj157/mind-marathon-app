@@ -312,10 +312,13 @@ All turn logic lives in the client. The relevant local state is declared at
 `GameScreen.tsx:41-54` (`rollResult`, `legalMoves`, `pendingMove`,
 `activeQuestion`, `isProcessing`, `winnerName`, …). The sequence:
 
-1. **Roll** — `handleRoll()` (`GameScreen.tsx:164-180`). Guards against
-   re-rolling, picks `Math.ceil(random*6)` client-side, animates a die for ~8
-   ticks, then sets `rollResult` and computes
-   `legalDestinations(me.position, finalRoll)`.
+1. **Roll** — `handleRoll()`. Guards against re-rolling, picks
+   `Math.ceil(random*6)` client-side, animates a die for ~8 ticks, then sets
+   `rollResult` and computes `legalDestinations(me.position, finalRoll)`. If that
+   is empty (a dead end — unreachable on the current d6 board but possible if the
+   graph/die/rules change), `autoPassNoMoves()` shows a brief "No moves — turn
+   passes" message, logs a non-move `turns` row, calls `end_turn`, and reloads
+   (`autoPassingRef` + `isProcessing` prevent double-firing).
 
 2. **Choose a legal square** — `handleSquarePress(pos)`
    (`GameScreen.tsx:183-256`). Rejects taps not in `legalMoves`. Writes the new

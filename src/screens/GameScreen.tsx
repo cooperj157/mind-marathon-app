@@ -129,6 +129,10 @@ export default function GameScreen({ route }: Props) {
     return () => clearInterval(id);
   }, [load]);
 
+  // Guards the "no legal moves → auto-pass" path against double-firing.
+  // Like the hooks below, declared before the loading early-return.
+  const autoPassingRef = useRef(false);
+
   // Per-player "it's your turn" highlight animation. Must be declared before
   // the loading early-return below, or the hook count changes between renders.
   const activeAnim = useRef<Record<string, Animated.Value>>({}).current;
@@ -199,10 +203,50 @@ export default function GameScreen({ route }: Props) {
         clearInterval(interval);
         setDisplayFace(finalRoll);
         setRollResult(finalRoll);
-        setLegalMoves(legalDestinations(me.position, finalRoll));
+        const dests = legalDestinations(me.position, finalRoll);
+        setLegalMoves(dests);
         setRolling(false);
+        // Dead-end guard: a roll with zero legal destinations leaves the turn
+        // stuck forever (no square to tap, no pass button). Provably impossible
+        // on the current d6 board (shortest cycle is 8 edges > 6), but a latent
+        // trap the moment the board graph / die / movement rules change. When it
+        // happens, auto-pass after a brief visible message.
+        if (dests.length === 0) void autoPassNoMoves();
       }
     }, 70);
+  }
+
+  // ── No legal moves → auto-pass ──────────────────────────────
+  // Logs a non-move (from_position == to_position, no question) then advances
+  // the turn. Reuses checkError / resetForRoll / load like every other branch.
+  // autoPassingRef + isProcessing keep it from firing twice for one roll.
+  async function autoPassNoMoves() {
+    if (!me || autoPassingRef.current || isProcessing) return;
+    autoPassingRef.current = true;
+    setIsProcessing(true);
+
+    // Let the "No moves — turn passes" footer message land before the flip.
+    await new Promise<void>(resolve => setTimeout(resolve, 1000));
+
+    const stay = me.position;
+    const loggedOk = await checkError(
+      supabase.from('turns').insert({
+        game_id: gameId, player_id: user!.id,
+        from_position: stay, to_position: stay,
+      }),
+      'Could not log the skipped turn. The board has been refreshed — please try again.',
+    );
+    if (loggedOk) {
+      await checkError(
+        supabase.rpc('end_turn', { p_game_id: gameId }),
+        'Could not pass your turn. The board has been refreshed — please try again.',
+      );
+    }
+
+    resetForRoll();
+    await load();
+    autoPassingRef.current = false;
+    setIsProcessing(false);
   }
 
   // ── Move chosen ─────────────────────────────────────────────
@@ -404,7 +448,7 @@ export default function GameScreen({ route }: Props) {
             <View style={styles.rollResult}>
               <Text style={styles.rollResultDie}>🎲 {rollResult}</Text>
               <Text style={styles.rollResultHint}>
-                {legalMoves.length > 0 ? 'Tap a highlighted square to move' : 'No moves available…'}
+                {legalMoves.length > 0 ? 'Tap a highlighted square to move' : 'No moves — turn passes'}
               </Text>
             </View>
           )
