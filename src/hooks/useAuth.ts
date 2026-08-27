@@ -24,5 +24,7 @@ export function useAuth() {
     return () => subscription.unsubscribe();
   }, []);
 
-  return { session, user, loading };
+  const signOut = () => supabase.auth.signOut();
+
+  return { session, user, loading, signOut };
 }
