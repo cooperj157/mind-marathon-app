@@ -7,12 +7,10 @@ create table public.profiles (
   created_at  timestamptz default now()
 );
 
--- Secure it: users can only read/write their own profile
+-- Secure it: users write only their own profile; the SELECT policy also lets
+-- you read the profile of anyone you share a game with (defined in the
+-- POLICIES section below, once game_players exists).
 alter table public.profiles enable row level security;
-
-create policy "Users can view their own profile"
-  on public.profiles for select
-  using (auth.uid() = id);
 
 create policy "Users can update their own profile"
   on public.profiles for update
@@ -71,44 +69,99 @@ alter table public.game_players enable row level security;
 -- ─────────────────────────────────────────────────────────────
 -- POLICIES
 -- Added after both tables exist so cross-table references work.
+--
+-- Membership ("is the caller in this game?") is checked through a
+-- SECURITY DEFINER helper. A plain subquery from game_players inside a
+-- game_players policy makes Postgres recurse (error 42P17), which also
+-- takes down every games / turns policy that reads game_players. The
+-- read inside a definer function is not subject to RLS, so it can't
+-- re-trigger the calling policy.
 -- ─────────────────────────────────────────────────────────────
 
--- Games: players can only see games they're in
+create or replace function public.is_game_member(p_game_id uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1 from public.game_players
+    where game_id = p_game_id and player_id = auth.uid()
+  );
+$$;
+
+-- Does the caller share any game with this other player? (Used to let
+-- opponents read each other's profile / username.)
+create or replace function public.shares_game_with(p_other uuid)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.game_players mine
+    join public.game_players theirs on theirs.game_id = mine.game_id
+    where mine.player_id = auth.uid() and theirs.player_id = p_other
+  );
+$$;
+
+revoke all on function public.is_game_member(uuid)   from public;
+revoke all on function public.shares_game_with(uuid) from public;
+grant execute on function public.is_game_member(uuid)   to authenticated;
+grant execute on function public.shares_game_with(uuid) to authenticated;
+
+-- Profiles: your own, plus anyone you share a game with (so the opponent's
+-- username resolves in GameScreen instead of falling back to "P2").
+create policy "Users can view profiles in their games"
+  on public.profiles for select
+  using (id = auth.uid() or public.shares_game_with(id));
+
+-- Games: a game you're in, or any game still waiting for an opponent
+-- (matchmaking needs to see open games to join them).
 create policy "Players can view their own games"
   on public.games for select
-  using (
-    exists (
-      select 1 from public.game_players
-      where game_id = games.id and player_id = auth.uid()
-    )
-  );
+  using (status = 'waiting' or public.is_game_member(id));
 
--- Game players: members can see all rows for their game
-create policy "Players can view game_players in their games"
-  on public.game_players for select
-  using (
-    exists (
-      select 1 from public.game_players gp
-      where gp.game_id = game_players.game_id and gp.player_id = auth.uid()
-    )
-  );
+-- Games: any signed-in user can open a new game.
+create policy "Authenticated users can create games"
+  on public.games for insert
+  with check (auth.uid() is not null);
 
--- Game players: each player can update only their own row
-create policy "Players can update their own game_player row"
-  on public.game_players for update
-  using (player_id = auth.uid());
+-- Games: only a member can mutate a game (status, board_layout, winner_id).
+create policy "Players can update their games"
+  on public.games for update
+  using (public.is_game_member(id));
 
 -- Games: a player can cancel their own game while it's still waiting
 -- for an opponent (no opponent has joined yet).
 create policy "Players can cancel their own waiting game"
   on public.games for delete
+  using (status = 'waiting' and public.is_game_member(id));
+
+-- Game players: members see all rows for their game; the roster of a
+-- 'waiting' game is visible to everyone so an opponent can join.
+create policy "Players can view game_players in their games"
+  on public.game_players for select
   using (
-    status = 'waiting'
-    and exists (
-      select 1 from public.game_players
-      where game_id = games.id and player_id = auth.uid()
+    public.is_game_member(game_id)
+    or exists (
+      select 1 from public.games g
+      where g.id = game_players.game_id and g.status = 'waiting'
     )
   );
+
+-- Game players: you may only add yourself to a game.
+create policy "Players can join a game as themselves"
+  on public.game_players for insert
+  with check (player_id = auth.uid());
+
+-- Game players: each player can update only their own row
+create policy "Players can update their own game_player row"
+  on public.game_players for update
+  using (player_id = auth.uid());
 
 -- ─────────────────────────────────────────────────────────────
 -- QUESTIONS

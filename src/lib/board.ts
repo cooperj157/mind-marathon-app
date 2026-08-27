@@ -85,22 +85,25 @@ export function neighbors(pos: Position): Position[] {
 
 // ─────────────────────────────────────────────────────────────
 // MOVEMENT
-// Walk exactly `steps` edges from `from`, never immediately reversing
-// the previous step (no backtracking). Returns the distinct squares a
-// pawn could legally land on, so the player picks among them.
+// Walk exactly `steps` edges from `from`. A move may never pass through
+// the same square twice — including the starting square — so once the
+// pawn commits to a direction it can't double back. Returns the distinct
+// squares a pawn could legally land on, for the player to pick among.
 // ─────────────────────────────────────────────────────────────
 export function legalDestinations(from: Position, steps: number): Position[] {
   const landings = new Set<Position>();
 
-  const walk = (pos: Position, prev: Position | null, left: number) => {
+  const walk = (pos: Position, visited: Set<Position>, left: number) => {
     if (left === 0) { landings.add(pos); return; }
     for (const next of neighbors(pos)) {
-      if (next === prev) continue;          // no instant backtrack
-      walk(next, pos, left - 1);
+      if (visited.has(next)) continue;      // never re-enter a visited square
+      visited.add(next);
+      walk(next, visited, left - 1);
+      visited.delete(next);
     }
   };
 
-  walk(from, null, steps);
+  walk(from, new Set([from]), steps);
   landings.delete(from);                    // can't land where you started
   return [...landings];
 }

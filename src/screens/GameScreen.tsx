@@ -87,16 +87,20 @@ export default function GameScreen({ route }: Props) {
 
     if (game?.status === 'completed' && game.winner_id) {
       const winner = mapped.find(p => p.player_id === game.winner_id);
-      setWinnerName(winner?.username ?? 'A player');
+      setWinnerName(
+        game.winner_id === user?.id
+          ? 'You'
+          : (winner?.username ?? (winner ? `P${winner.turn_order}` : 'A player')),
+      );
     }
 
     setLoading(false);
-  }, [gameId]);
+  }, [gameId, user?.id]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
   useEffect(() => { load(); }, [load]);
 
-  // Realtime: re-fetch whenever this game's rows change
+  // Realtime: re-fetch whenever this game's rows change.
   useEffect(() => {
     const channel = supabase
       .channel(`game:${gameId}`)
@@ -108,10 +112,40 @@ export default function GameScreen({ route }: Props) {
         event: '*', schema: 'public', table: 'games',
         filter: `id=eq.${gameId}`,
       }, () => load())
-      .subscribe();
+      .subscribe((status) => {
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.warn('[game] realtime channel', status, '- falling back to polling');
+        }
+      });
 
     return () => { supabase.removeChannel(channel); };
   }, [gameId, load]);
+
+  // Polling fallback: realtime needs the games / game_players tables added to
+  // the `supabase_realtime` publication, and the socket can still drop. A
+  // turn-based game is cheap to poll, so keep a slow refresh running too.
+  useEffect(() => {
+    const id = setInterval(() => { load(); }, 4000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  // Per-player "it's your turn" highlight animation. Must be declared before
+  // the loading early-return below, or the hook count changes between renders.
+  const activeAnim = useRef<Record<string, Animated.Value>>({}).current;
+  const animForPlayer = useCallback((id: string, active: boolean): Animated.Value => {
+    if (!activeAnim[id]) activeAnim[id] = new Animated.Value(active ? 1 : 0);
+    return activeAnim[id];
+  }, [activeAnim]);
+
+  useEffect(() => {
+    players.forEach(p => {
+      Animated.timing(animForPlayer(p.player_id, p.is_current_turn), {
+        toValue: p.is_current_turn ? 1 : 0,
+        duration: 250,
+        useNativeDriver: false,
+      }).start();
+    });
+  }, [players, animForPlayer]);
 
   if (loading || !layout) {
     return (
@@ -123,23 +157,6 @@ export default function GameScreen({ route }: Props) {
 
   const me     = players.find(p => p.player_id === user?.id);
   const myTurn = !!me?.is_current_turn;
-
-  const activeAnim = useRef<Record<string, Animated.Value>>({}).current;
-  function animForPlayer(id: string, active: boolean): Animated.Value {
-    if (!activeAnim[id]) activeAnim[id] = new Animated.Value(active ? 1 : 0);
-    return activeAnim[id];
-  }
-
-  useEffect(() => {
-    players.forEach(p => {
-      Animated.timing(animForPlayer(p.player_id, p.is_current_turn), {
-        toValue: p.is_current_turn ? 1 : 0,
-        duration: 250,
-        useNativeDriver: false,
-      }).start();
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [players]);
 
   const pawns: PawnInfo[] = players.map(p => ({
     id:       p.player_id,
@@ -158,6 +175,15 @@ export default function GameScreen({ route }: Props) {
       Alert.alert('Sync error', message);
     }
     return !error;
+  }
+
+  // Clear the turn-local state so the SAME player can roll again (landing on
+  // a roll-again square, or answering a question correctly).
+  function resetForRoll() {
+    setRollResult(null);
+    setDisplayFace(null);
+    setLegalMoves([]);
+    setPendingMove(null);
   }
 
   // ── Roll ────────────────────────────────────────────────────
@@ -195,40 +221,22 @@ export default function GameScreen({ route }: Props) {
 
     const sq = squareAt(layout!, pos);
 
-    if (sq.kind === 'roll_again' || sq.kind === 'start') {
-      const turnOk = await checkError(
-        supabase.from('turns').insert({
-          game_id: gameId, player_id: user!.id,
-          from_position: fromPos, to_position: pos,
-        }),
-        'Could not log your move. The board has been refreshed — please try again.',
-      );
-      if (!turnOk) { await load(); setIsProcessing(false); return; }
-
-      const endOk = await checkError(
-        supabase.rpc('end_turn', { p_game_id: gameId }),
-        'Could not end your turn. The board has been refreshed — please try again.',
-      );
-      if (!endOk) { await load(); setIsProcessing(false); return; }
-
-      setRollResult(null);
-      await load();
-      setIsProcessing(false);
-      return;
+    // Category squares serve a question. Roll-again / start squares don't —
+    // and a category square with an empty bank falls back to the same path:
+    // log the move, then let the SAME player roll again (turn does NOT pass).
+    let question: QuestionData | null = null;
+    if (sq.kind === 'category') {
+      const { data, error: questionErr } = await supabase.rpc('random_question', { p_category: sq.category });
+      if (questionErr) {
+        Alert.alert('Sync error', 'Could not fetch a question. The board has been refreshed — please try again.');
+        await load();
+        setIsProcessing(false);
+        return;
+      }
+      question = (data as QuestionData[] | null)?.[0] ?? null;
     }
-
-    // category square — fetch a question
-    const { data, error: questionErr } = await supabase.rpc('random_question', { p_category: sq.category });
-    if (questionErr) {
-      Alert.alert('Sync error', 'Could not fetch a question. The board has been refreshed — please try again.');
-      await load();
-      setIsProcessing(false);
-      return;
-    }
-    const question = (data as QuestionData[] | null)?.[0] ?? null;
 
     if (!question) {
-      // No questions seeded yet — treat as roll_again
       const turnOk = await checkError(
         supabase.from('turns').insert({
           game_id: gameId, player_id: user!.id,
@@ -238,13 +246,7 @@ export default function GameScreen({ route }: Props) {
       );
       if (!turnOk) { await load(); setIsProcessing(false); return; }
 
-      const endOk = await checkError(
-        supabase.rpc('end_turn', { p_game_id: gameId }),
-        'Could not end your turn. The board has been refreshed — please try again.',
-      );
-      if (!endOk) { await load(); setIsProcessing(false); return; }
-
-      setRollResult(null);
+      resetForRoll();
       await load();
       setIsProcessing(false);
       return;
@@ -277,8 +279,7 @@ export default function GameScreen({ route }: Props) {
     );
     if (!turnOk) {
       await load();
-      setPendingMove(null);
-      setRollResult(null);
+      resetForRoll();
       setIsProcessing(false);
       return;
     }
@@ -296,8 +297,7 @@ export default function GameScreen({ route }: Props) {
       );
       if (!checkpointOk) {
         await load();
-        setPendingMove(null);
-        setRollResult(null);
+        resetForRoll();
         setIsProcessing(false);
         return;
       }
@@ -309,8 +309,7 @@ export default function GameScreen({ route }: Props) {
         );
         if (!winOk) {
           await load();
-          setPendingMove(null);
-          setRollResult(null);
+          resetForRoll();
           setIsProcessing(false);
           return;
         }
@@ -319,22 +318,23 @@ export default function GameScreen({ route }: Props) {
       }
     }
 
-    if (!won) {
+    // Correct answer → keep the turn and roll again. Wrong answer → pass it on.
+    if (!won && correct) {
+      resetForRoll();
+    } else if (!won) {
       const endOk = await checkError(
         supabase.rpc('end_turn', { p_game_id: gameId }),
         'Could not end your turn. The board has been refreshed — please try again.',
       );
       if (!endOk) {
         await load();
-        setPendingMove(null);
-        setRollResult(null);
+        resetForRoll();
         setIsProcessing(false);
         return;
       }
+      resetForRoll();
     }
 
-    setPendingMove(null);
-    setRollResult(null);
     await load();
     setIsProcessing(false);
   }
