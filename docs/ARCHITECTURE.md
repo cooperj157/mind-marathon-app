@@ -31,7 +31,7 @@ Edge Function, never from the client.
              │  @supabase/supabase-js (anon key)
              │  · auth (email+password)
              │  · PostgREST reads/writes (RLS-gated)
-             │  · rpc(): end_turn / random_question / declare_winner
+             │  · rpc(): find_or_create_game / end_turn / random_question / declare_winner
              │  · realtime: postgres_changes
              ▼
 ┌──────────────────────────────────────────────┐
@@ -193,11 +193,29 @@ SECURITY DEFINER, since the new user cannot yet write through RLS.
 
 ## 4. Server-side logic (RPCs)
 
-`supabase/turn-rpcs.sql`. All three are `SECURITY DEFINER`, i.e. they execute
-with the **function owner's** privileges and bypass RLS. This is necessary
-because RLS restricts each player to updating **only their own** `game_players`
-row, but turn advancement and winner-marking must write rows/tables the caller
-cannot touch directly.
+`supabase/turn-rpcs.sql` (turn/question/winner) and
+`supabase/2026-08-27-matchmaking.sql` (matchmaking). All are `SECURITY DEFINER`,
+i.e. they execute with the **function owner's** privileges and bypass RLS. This
+is necessary because RLS restricts each player to updating **only their own**
+`game_players` row, but turn advancement, winner-marking, and matchmaking must
+write rows/tables the caller cannot touch directly.
+
+- **`find_or_create_game(p_board_layout jsonb) → table(game_id uuid, is_player_one boolean)`**
+  (`supabase/2026-08-27-matchmaking.sql`). The **only** way the client starts a
+  game (`LobbyScreen.handleStartGame`). Runs the whole find-or-create decision
+  as one serialized transaction: takes a global `pg_advisory_xact_lock` (so two
+  simultaneous callers can't both fall through to "create a new waiting game"),
+  then — return the caller's own pending `waiting` game if any; else claim the
+  oldest joinable `waiting` game with `FOR UPDATE SKIP LOCKED`, insert the
+  caller as `turn_order` 2 and flip the game to `active`; else create a fresh
+  `waiting` game with the caller as `turn_order` 1. `board_layout` is generated
+  client-side by `generateBoardLayout()` and passed in (ignored on the join
+  path). SECURITY DEFINER also means the matchmaking writes no longer depend on
+  any client INSERT/UPDATE policy for `games` / `game_players` (see §9.5).
+  Concurrency argument: because every call serializes on the advisory lock and
+  commits before the next enters, the loser of a create race sees the winner's
+  `waiting` game and joins it — two racers always end in the same game, never
+  two orphans, never a `(game_id, turn_order)` unique-constraint crash.
 
 - **`end_turn(p_game_id uuid) → void`** (`turn-rpcs.sql:5-31`).
   Reads the current player's `turn_order` and the player count, computes the next
@@ -433,15 +451,16 @@ Grounded in the code as read; the ones I'd prioritize:
    (`GameScreen.tsx:17`), matchmaking always joins as `turn_order: 2`
    (`LobbyScreen.tsx:59`). Only `end_turn`'s modulo would survive more players.
 
-5. **Matchmaking races.** `handleStartGame` (`LobbyScreen.tsx:38-101`) reads
-   waiting games then inserts — two players starting simultaneously can each fail
-   to see the other's freshly-created waiting game and both create their own,
-   never matching (they'd each sit waiting). The *join* collision is handled: a
-   duplicate `turn_order:2` insert hits the UNIQUE constraint (`23505`) and the
-   loop retries (`LobbyScreen.tsx:63-64`). But joining player-2 and flipping
-   `games.status` to `active` are **two separate statements**
-   (`LobbyScreen.tsx:56-71`) with no transaction — a crash between them leaves a
-   full 2-player game stuck in `waiting`.
+5. **Matchmaking races — FIXED 2026-08-27.** `handleStartGame` used to read
+   waiting games then insert client-side; two players starting simultaneously
+   could each miss the other's freshly-created waiting game and both create
+   their own, never matching, leaving orphan `waiting` games. The join +
+   status-flip were also two un-transacted statements. Replaced with a single
+   `supabase.rpc('find_or_create_game', …)` call — one serialized SECURITY
+   DEFINER transaction (see §4). The client no longer touches `games` /
+   `game_players` for matchmaking at all. Requires
+   `supabase/2026-08-27-matchmaking.sql` to be run (prerequisite:
+   `supabase/2026-08-27-rls-realtime-fixes.sql`).
 
 6. **Turn can stall if `is_current_turn` invariant breaks.** `end_turn` reads the
    single current-turn row; if zero rows are flagged (partial failure elsewhere),
@@ -456,12 +475,14 @@ Grounded in the code as read; the ones I'd prioritize:
    is a latent edge case rather than a common one.
 
 8. **RLS policies for games/game_players INSERT/UPDATE are not in `schema.sql`.**
-   The Lobby inserts `games` and `game_players` rows and updates `games.status`
-   (`LobbyScreen.tsx:56-90`), but this file defines no INSERT policy and no
-   generic UPDATE policy for those tables. Either the live project has additional
-   permissive policies not captured here, or these writes rely on configuration
-   outside this repo. **Ambiguous from the code alone — worth confirming against
-   the live database.**
+   As of 2026-08-27 the Lobby no longer inserts `games`/`game_players` or flips
+   `games.status` directly — matchmaking goes through the SECURITY DEFINER
+   `find_or_create_game` RPC, which bypasses RLS. The remaining client writes to
+   these tables are `GameScreen`'s own-row `game_players` UPDATE (policy exists,
+   `schema.sql`) and the `board_layout` backfill in `GameScreen.load()` (relies
+   on the "Players can update their games" UPDATE policy). Whether a permissive
+   INSERT policy still lingers in the live project is now moot for matchmaking
+   but **still worth confirming** for the backfill path.
 
 9. **Usernames are never set.** The trigger creates `profiles` with `username`
    null (`schema.sql:26`), and no screen ever writes a username. So the UI always

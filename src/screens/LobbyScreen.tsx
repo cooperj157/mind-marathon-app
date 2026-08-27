@@ -39,60 +39,20 @@ export default function LobbyScreen({ navigation }: Props) {
     if (!user) return;
     setStarting(true);
     try {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        // Look for a game in 'waiting' status that the current user hasn't joined
-        const { data: waitingGames } = await supabase
-          .from('games')
-          .select('id, game_players(player_id)')
-          .eq('status', 'waiting')
-          .limit(10);
+      // Matchmaking is a single atomic server operation (see
+      // supabase/2026-08-27-matchmaking.sql). The RPC serializes the whole
+      // find-or-create decision, so two players tapping "Start Game" at the
+      // same time deterministically land in the SAME game — one as P1, one as
+      // P2 — instead of each creating an orphan 'waiting' game.
+      const { data, error } = await supabase.rpc('find_or_create_game', {
+        p_board_layout: generateBoardLayout(),
+      });
+      if (error) throw error;
 
-        const joinable = waitingGames?.find(g =>
-          !(g.game_players as { player_id: string }[]).some(p => p.player_id === user.id)
-        );
+      const match = Array.isArray(data) ? data[0] : data;
+      if (!match?.game_id) throw new Error('Matchmaking failed — please try again.');
 
-        if (joinable) {
-          // Join the existing game as player 2
-          const { error: joinErr } = await supabase.from('game_players').insert({
-            game_id:         joinable.id,
-            player_id:       user.id,
-            turn_order:      2,
-            is_current_turn: false,
-          });
-
-          if (joinErr) {
-            if (joinErr.code === '23505') continue; // someone else grabbed slot 2 — retry
-            throw joinErr;
-          }
-
-          await supabase
-            .from('games')
-            .update({ status: 'active' })
-            .eq('id', joinable.id);
-          navigation.navigate('Game', { gameId: joinable.id });
-          return;
-        }
-
-        // No waiting game found — create a new one
-        const { data: newGame, error } = await supabase
-          .from('games')
-          .insert({ status: 'waiting', board_layout: generateBoardLayout() })
-          .select()
-          .single();
-
-        if (error || !newGame) throw error ?? new Error('Failed to create game');
-
-        await supabase.from('game_players').insert({
-          game_id:         newGame.id,
-          player_id:       user.id,
-          turn_order:      1,
-          is_current_turn: true,
-        });
-        navigation.navigate('Game', { gameId: newGame.id });
-        return;
-      }
-
-      Alert.alert('Error', 'Could not join a game right now — please try again.');
+      navigation.navigate('Game', { gameId: match.game_id as string });
     } catch (err: any) {
       Alert.alert('Error', err?.message ?? 'Could not start game. Please try again.');
     } finally {
