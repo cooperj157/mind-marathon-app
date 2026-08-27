@@ -148,6 +148,27 @@ The core loop was assessed "Done" from the code in August but had **never actual
 - **Realtime** — add `games`/`game_players`/`turns` to the `supabase_realtime` publication (they never were, so `postgres_changes` never fired; opponent's board only updated on reload). A 4s polling fallback now covers the gap regardless.
 - **Profile visibility** — the `profiles` SELECT policy was self-only, so `GameScreen`'s `profiles(username)` join always returned `null` for the opponent. New `shares_game_with()` helper + policy lets game-mates read each other's username (unblocks B2 actually mattering).
 
+### Follow-up hardening — board_layout (`supabase/2026-08-27-board-layout.sql`)
+
+Play-test observation G4/#7 noted `GameScreen.load()` would regenerate
+`board_layout` and write it back whenever it looked missing/invalid — two
+clients could race that and write different layouts after pawns had moved, and
+regenerating mid-game invalidates every position.
+
+- **DB now guarantees it.** `games.board_layout` is `NOT NULL DEFAULT
+  public.generate_board_layout()` with a `games_board_layout_shape` CHECK. The
+  SQL generator mirrors `src/lib/boardLayout.ts`. Any creation path that omits
+  the column (a future matchmaking RPC, a manual insert) still gets a valid
+  distinct layout. Migration is idempotent; it backfills only `waiting` games
+  and adds the CHECK `NOT VALID` so legacy rows don't block it.
+- **`load()` no longer guesses.** It self-heals only when unambiguously safe —
+  `status='waiting'` ∧ caller is player 1 ∧ no `turns` row — which exactly one
+  client can satisfy (a waiting game's roster is player 1 alone), so no race.
+  Otherwise it `console.error`s and renders a "This game's board is corrupted"
+  screen instead of rewriting a live board.
+- Needs the one-time SQL run; the client change is safe to ship before it (the
+  Lobby still writes a layout explicitly at creation).
+
 ### New observations (not yet actioned)
 
 - **Completed games are unreachable.** Once `status = 'completed'`, `useGames` filters the game out and there's no route back to it — neither player can review the result. With no push (B4), a finished game just vanishes from both lobbies; the loser may never see it ended.
