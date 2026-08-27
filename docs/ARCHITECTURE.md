@@ -258,9 +258,25 @@ The per-game layout is randomized by `generateBoardLayout()`
 (`boardLayout.ts:53-72`): the 6 **hubs** are a shuffle of all 6 categories so
 every checkpoint is a distinct wedge; each spoke gets 2 categories drawn from a
 shuffled double-deck; the 6 **betweens** are 4 random categories + 2 `roll_again`,
-shuffled. It's generated at game creation in the Lobby
-(`LobbyScreen.tsx:79`) and re-generated defensively in `GameScreen.load()` if the
-stored layout is missing/invalid (`GameScreen.tsx:63-67`).
+shuffled.
+
+**A valid layout is guaranteed exactly once, at INSERT.** The Lobby's create
+branch writes one (`LobbyScreen.tsx:79`), and the `games` table itself now
+carries `board_layout jsonb NOT NULL DEFAULT public.generate_board_layout()` plus
+a `games_board_layout_shape` CHECK — a SQL function (`schema.sql`, added by
+`supabase/2026-08-27-board-layout.sql`) that produces the same shape as
+`generateBoardLayout()`. So any creation path that omits the column (a future
+matchmaking RPC, a manual insert) still gets a distinct valid layout, and a
+malformed one can't be written.
+
+`GameScreen.load()` therefore no longer blindly regenerates. If it still finds
+the layout missing/invalid it **self-heals only when that is provably safe** —
+`status = 'waiting'`, the caller is player 1, and no `turns` row exists — which,
+because a waiting game's roster is player 1 alone, exactly one client can ever
+satisfy, so there is no concurrent-regeneration race. In every other case
+(a live or completed game) it does **not** guess: it `console.error`s and renders
+a "This game's board is corrupted" state, since regenerating mid-game would
+invalidate every stored pawn position.
 
 ### 5.3 Adjacency graph (`board.ts:65-84`)
 
@@ -448,12 +464,16 @@ Grounded in the code as read; the ones I'd prioritize:
    `v_current_order` is null and nothing advances (`turn-rpcs.sql:15-29`). There's
    no lock around read-modify-write of turn state.
 
-7. **Divergent board-layout fallback.** If `board_layout` is somehow null,
-   `GameScreen.load()` generates a fresh one and writes it back
-   (`GameScreen.tsx:63-67`). Two clients hitting that path concurrently could
-   generate *different* layouts (last write wins), desyncing the board. In
-   practice the Lobby sets the layout at creation (`LobbyScreen.tsx:79`), so this
-   is a latent edge case rather than a common one.
+7. **Divergent board-layout fallback.** ~~If `board_layout` is somehow null,
+   `GameScreen.load()` generates a fresh one and writes it back; two clients
+   hitting that path concurrently could generate *different* layouts.~~
+   **Resolved (2026-08-27).** `board_layout` is now `NOT NULL DEFAULT
+   generate_board_layout()` with a shape CHECK at the DB level
+   (`supabase/2026-08-27-board-layout.sql`), so the column is always valid at
+   creation regardless of the insert path. `load()` no longer blindly
+   regenerates: it self-heals only in the single-writer pre-game case
+   (`status='waiting'` ∧ player 1 ∧ no turns) and otherwise surfaces a
+   "board corrupted" error rather than racing a rewrite (§5.2).
 
 8. **RLS policies for games/game_players INSERT/UPDATE are not in `schema.sql`.**
    The Lobby inserts `games` and `game_players` rows and updates `games.status`

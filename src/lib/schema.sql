@@ -34,14 +34,67 @@ create trigger on_auth_user_created
 -- GAMES
 -- One row per match. board_layout stores the randomly generated
 -- square-to-category assignments for that game.
+--
+-- board_layout is guaranteed at INSERT by the DB itself: NOT NULL with a
+-- DEFAULT that generates a valid layout server-side (mirrors
+-- src/lib/boardLayout.ts generateBoardLayout()). No client creation path — and
+-- no future matchmaking RPC — has to synthesise one, and the client never
+-- regenerates a live board. See supabase/2026-08-27-board-layout.sql.
 -- ─────────────────────────────────────────────────────────────
+create or replace function public.generate_board_layout()
+returns jsonb
+language plpgsql
+volatile
+set search_path = public
+as $$
+declare
+  cats       text[] := array['science','history','geography','entertainment','sports','art_lit'];
+  hubs       text[];
+  spoke_pool text[];
+  spokes     jsonb := '[]'::jsonb;
+  betweens   text[];
+  i          int;
+begin
+  select array_agg(c order by random()) into hubs
+  from unnest(cats) as c;
+
+  select array_agg(c order by random()) into spoke_pool
+  from unnest(cats || cats) as c;
+
+  for i in 0..5 loop
+    spokes := spokes || jsonb_build_array(
+      jsonb_build_array(spoke_pool[i * 2 + 1], spoke_pool[i * 2 + 2])
+    );
+  end loop;
+
+  select array_agg(c order by random()) into betweens
+  from (select c from unnest(cats) as c order by random() limit 4) as picked(c);
+  betweens := betweens || array['roll_again', 'roll_again'];
+  select array_agg(b order by random()) into betweens
+  from unnest(betweens) as b;
+
+  return jsonb_build_object(
+    'hubs',     to_jsonb(hubs),
+    'spokes',   spokes,
+    'betweens', to_jsonb(betweens)
+  );
+end;
+$$;
+
+grant execute on function public.generate_board_layout() to authenticated;
+
 create table public.games (
   id           uuid primary key default gen_random_uuid(),
   status       text not null default 'waiting'
                  check (status in ('waiting', 'active', 'completed')),
   winner_id    uuid references public.profiles(id) on delete set null,
-  board_layout jsonb,
-  created_at   timestamptz default now()
+  board_layout jsonb not null default public.generate_board_layout(),
+  created_at   timestamptz default now(),
+  constraint games_board_layout_shape check (
+    jsonb_typeof(board_layout -> 'hubs')     = 'array' and
+    jsonb_typeof(board_layout -> 'spokes')   = 'array' and
+    jsonb_typeof(board_layout -> 'betweens') = 'array'
+  )
 );
 
 alter table public.games enable row level security;

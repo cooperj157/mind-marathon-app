@@ -41,6 +41,7 @@ export default function GameScreen({ route }: Props) {
   const [layout,  setLayout]  = useState<BoardLayout | null>(null);
   const [players, setPlayers] = useState<PlayerRow[]>([]);
   const [loading, setLoading] = useState(true);
+  const [boardError, setBoardError] = useState(false);
 
   // turn state
   const [rollResult,      setRollResult]      = useState<number | null>(null);
@@ -60,11 +61,50 @@ export default function GameScreen({ route }: Props) {
       .eq('id', gameId)
       .single();
 
+    // board_layout is set authoritatively at game creation — LobbyScreen writes
+    // one, and the DB also has `board_layout NOT NULL DEFAULT generate_board_layout()`
+    // (supabase/2026-08-27-board-layout.sql) so any other creation path (e.g. a
+    // future matchmaking RPC) still gets a valid layout. If we nonetheless find
+    // it missing/invalid, only self-heal when it is unambiguously safe. Blindly
+    // regenerating a live board would (a) let two clients write different random
+    // layouts, last-write-wins, and (b) invalidate every pawn position.
     let boardLayout = game?.board_layout;
     if (!isValidLayout(boardLayout)) {
+      const [{ data: turnRows }, { data: firstPlayer }] = await Promise.all([
+        supabase.from('turns').select('id').eq('game_id', gameId).limit(1),
+        supabase.from('game_players').select('player_id').eq('game_id', gameId).eq('turn_order', 1).limit(1),
+      ]);
+
+      // Safe only when the game has not started: still 'waiting', we are player 1,
+      // and no turn has been logged. While 'waiting' the roster is player 1 alone,
+      // so exactly one client can ever satisfy this — no concurrent regeneration.
+      const safeToHeal =
+        !!user?.id &&
+        game?.status === 'waiting' &&
+        firstPlayer?.[0]?.player_id === user.id &&
+        (turnRows?.length ?? 0) === 0;
+
+      if (!safeToHeal) {
+        console.error(
+          '[game] board_layout missing/invalid on a live game — refusing to regenerate',
+          { gameId, status: game?.status },
+        );
+        setBoardError(true);
+        setLoading(false);
+        return;
+      }
+
       boardLayout = generateBoardLayout();
-      await supabase.from('games').update({ board_layout: boardLayout }).eq('id', gameId);
+      const { error: healErr } = await supabase
+        .from('games').update({ board_layout: boardLayout }).eq('id', gameId);
+      if (healErr) {
+        console.error('[game] board_layout self-heal write failed', healErr);
+        setBoardError(true);
+        setLoading(false);
+        return;
+      }
     }
+    setBoardError(false);
     setLayout(boardLayout);
 
     const { data: rows } = await supabase
@@ -146,6 +186,18 @@ export default function GameScreen({ route }: Props) {
       }).start();
     });
   }, [players, animForPlayer]);
+
+  if (boardError) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.boardErrorTitle}>This game's board is corrupted</Text>
+        <Text style={styles.boardErrorBody}>
+          Its layout data is missing or invalid and can't be safely rebuilt mid-game.
+          Start a new game to keep playing.
+        </Text>
+      </View>
+    );
+  }
 
   if (loading || !layout) {
     return (
@@ -441,6 +493,9 @@ function Wedges({ cleared }: { cleared: string[] }) {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F4E4BC', padding: 16 },
   center:    { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#F4E4BC' },
+
+  boardErrorTitle: { fontSize: 18, fontWeight: '700', color: '#C0392B', textAlign: 'center', paddingHorizontal: 32 },
+  boardErrorBody:  { fontSize: 14, color: '#5A4632', textAlign: 'center', paddingHorizontal: 32, marginTop: 8, lineHeight: 20 },
 
   winnerBanner: {
     backgroundColor: '#C8930A', borderRadius: 12, padding: 12, marginBottom: 10, alignItems: 'center',
