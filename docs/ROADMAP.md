@@ -14,7 +14,7 @@ Last assessed: 2026-08-11, grounded in the code at commit `e00763c`. **Amended 2
 | 2 | Auth (email/password sign in & sign up) | **Done** | `LoginScreen.tsx`, `useAuth.ts`, `supabase.auth.signInWithPassword`/`signUp` |
 | 3 | Schema (profiles/games/game_players/questions/turns) | **Done** | `src/lib/schema.sql` — 5 tables + RLS. **RLS was broken until 2026-08-27** (recursive `game_players` policy → 42P17 on every read); fixed in `supabase/2026-08-27-rls-realtime-fixes.sql`. |
 | 4 | Question engine (edge fn + seed + weekly cron) | **Partial** | Edge fn `supabase/functions/generate-questions/index.ts` written; `scripts/seed-questions.sh` is a manual one-shot; `supabase/cron.sql` is **entirely commented out / disabled**. **Bank confirmed seeded — exactly 100 rows/category, all 6 categories (verified 2026-08-27)** — rows dated 2026-07-06, not refreshed since (weekly cron still off). |
-| 5 | Lobby + matchmaking + roll + questions + realtime | **Done (as of 2026-08-27)** | `LobbyScreen.tsx` (start/join/cancel), `GameScreen.tsx` (roll/move/answer). Matchmaking + a full game to a win were **verified end-to-end for the first time on 2026-08-27** — previously blocked by the RLS recursion and a Rules-of-Hooks crash in `GameScreen`. |
+| 5 | Lobby + matchmaking + roll + questions + realtime | **Done (as of 2026-08-27)** | `LobbyScreen.tsx` (start/join/cancel), `GameScreen.tsx` (roll/move/answer). Matchmaking + a full game to a win were **verified end-to-end for the first time on 2026-08-27** — previously blocked by the RLS recursion and a Rules-of-Hooks crash in `GameScreen`. **Matchmaking race fixed 2026-08-27** — client find-or-create replaced by the atomic `find_or_create_game` RPC (`supabase/2026-08-27-matchmaking.sql`, needs a one-time SQL run; prerequisite: `2026-08-27-rls-realtime-fixes.sql`). |
 | 6a | Board render | **Done** | `src/components/BoardView.tsx`, `src/lib/board.ts`, `src/lib/boardLayout.ts` |
 | 6b | Dice / movement | **Done** | `handleRoll`/`handleSquarePress` in `GameScreen.tsx`; animated dice + pawn. Movement now forbids revisiting any square in one move (`board.ts` `legalDestinations`). |
 | 6c | Questions / wedges / turn / win | **Done (as of 2026-08-27)** | `QuestionModal.tsx`, `Wedges`, `end_turn`/`declare_winner` RPCs. Win + banner verified 2026-08-27. Turn rule changed: a **correct answer keeps the turn and rolls again**; only a wrong answer passes it. |
@@ -130,7 +130,7 @@ That's the v1 target. Given the **friends-only audience**, **B5/B6** (server-sid
 
 ## 6. First end-to-end play-test — 2026-08-27
 
-The core loop was assessed "Done" from the code in August but had **never actually run a 2-player game to completion**. First real play-test (one human, one Claude-driven opponent on Expo web) surfaced five bugs, four fixed in code, one needing a SQL step.
+The core loop was assessed "Done" from the code in August but had **never actually run a 2-player game to completion**. First real play-test (one human, one Claude-driven opponent on Expo web) surfaced five bugs, four fixed in code, one needing a SQL step. A sixth — the matchmaking race — was fixed shortly after (code + a new SQL file, `supabase/2026-08-27-matchmaking.sql`).
 
 ### Fixed
 
@@ -141,12 +141,21 @@ The core loop was assessed "Done" from the code in August but had **never actual
 | 3 | **Correct answer ended the turn.** `end_turn` fired regardless of correctness; roll-again / START squares also wrongly ended it. | `resetForRoll()` helper: correct answer (and roll-again/START) keeps the turn; only a wrong answer calls `end_turn`. |
 | 4 | **Winner banner read "A player wins!"** for the winner. `load()`'s post-win refetch overwrote the "You" name and the opponent's username is `null`. | `load()` checks `winner_id === user.id` → "You", else `username ?? P{turn_order}`. |
 | — | **Movement could curl back on itself.** `legalDestinations` only blocked immediate U-turns. | Now tracks a `visited` set — no square is entered twice in one move. (No-op on the current board: shortest cycle is 8, die max is 6. Future-proofs a bigger board.) |
+| 5 | **Matchmaking race — orphan `waiting` games.** `handleStartGame` read `waiting` games then created one client-side; two players tapping "Start Game" together both saw "none" and both created, never matching. Join + status-flip were also un-transacted. | Replaced the client loop with one `supabase.rpc('find_or_create_game', { p_board_layout })` call. The RPC serializes the whole find-or-create on a `pg_advisory_xact_lock`, claims a joinable game with `FOR UPDATE SKIP LOCKED`, and does join + activate in one transaction. `supabase/2026-08-27-matchmaking.sql` + `schema.sql` + `LobbyScreen.tsx`. **Needs a one-time SQL run** (prerequisite: `2026-08-27-rls-realtime-fixes.sql`). |
 | — | **"No legal moves" was a dead end.** If a roll yielded zero legal destinations, `GameScreen` showed "No moves available…" with no button to pass or re-roll — the turn stuck forever. Unreachable on the current d6 board (shortest cycle 8 > 6, and the `visited`-set change above doesn't alter that), but a latent trap the moment the board graph / die / movement rules change. | `handleRoll` now detects `legalDestinations(...) === []` and calls `autoPassNoMoves()`: after a ~1s visible "No moves — turn passes" message it logs a non-move `turns` row (`from_position == to_position`, `question_id` null) and calls `end_turn`, then `resetForRoll()` + `load()`. Reuses `checkError` / `resetForRoll`. `autoPassingRef` + `isProcessing` guard against double-firing. Composes with the roll-again rule: each roll is an independent check, so a turn kept after a correct answer that then rolls into a dead end still auto-passes. |
 
-### Needs a one-time SQL run (`supabase/2026-08-27-rls-realtime-fixes.sql`)
+### Needs a one-time SQL run
+
+**`supabase/2026-08-27-rls-realtime-fixes.sql`** (run this first — it's a prerequisite for the matchmaking file):
 
 - **Realtime** — add `games`/`game_players`/`turns` to the `supabase_realtime` publication (they never were, so `postgres_changes` never fired; opponent's board only updated on reload). A 4s polling fallback now covers the gap regardless.
 - **Profile visibility** — the `profiles` SELECT policy was self-only, so `GameScreen`'s `profiles(username)` join always returned `null` for the opponent. New `shares_game_with()` helper + policy lets game-mates read each other's username (unblocks B2 actually mattering).
+
+**`supabase/2026-08-27-matchmaking.sql`** (run after the file above):
+
+- **Atomic matchmaking** — creates the `find_or_create_game(p_board_layout jsonb)` SECURITY DEFINER RPC that `LobbyScreen` now calls instead of doing client-side find-or-create. Fixes the orphan-`waiting`-games race (see the Fixed table, bug 5). Idempotent (`create or replace`).
+
+**`supabase/2026-08-27-board-layout.sql`** (order-independent of the two above) — see "Follow-up hardening" just below.
 
 ### Follow-up hardening — board_layout (`supabase/2026-08-27-board-layout.sql`)
 
